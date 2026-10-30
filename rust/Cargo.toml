@@ -1,0 +1,17 @@
+[package]
+name = "mqtt_bench"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# MQTT v5 client, pure Rust. TLS/websocket features disabled to keep the binary lean.
+rumqttc = { version = "0.25", default-features = false }
+serde_json = "1"
+libc = "0.2"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

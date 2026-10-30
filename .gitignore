@@ -1,0 +1,10 @@
+.tools/
+results/
+c/build/
+cpp/build/
+zig/zig-out/
+zig/.zig-cache/
+rust/target/
+python/.venv/
+__pycache__/
+.task/

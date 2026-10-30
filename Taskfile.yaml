@@ -1,0 +1,177 @@
+# Language comparison: MQTT v5 client in C, C++, Zig, Rust and Python.
+#
+#   task setup          # fetch Zig toolchain + Python venv (one time)
+#   task build          # build everything
+#   task bench          # run each program for 2 min under measurement, then print a table
+#   task bench DURATION=20   # shorter run (every program accepts the duration as argv[1])
+#   task bench:rust     # a single language
+#   task report         # re-print the table from results/
+#   task send MESSAGE="hi"   # publish a JSON message to test/receive by hand
+#   task listen         # watch test/send
+version: '3'
+
+vars:
+  DURATION: '{{.DURATION | default "120"}}'
+  ZIG_VERSION: 0.17.0
+  ZIG: .tools/zig/zig
+  PY: python/.venv/bin/python
+  C_BIN: c/build/mqtt_bench
+  CPP_BIN: cpp/build/mqtt_bench
+  ZIG_BIN: zig/zig-out/bin/mqtt_bench
+  RUST_BIN: rust/target/release/mqtt_bench
+
+tasks:
+  default:
+    cmds: [task --list]
+
+  # ---------------------------------------------------------------- setup
+  setup:
+    desc: Install the Zig toolchain into .tools/ and create the Python venv
+    deps: [setup:zig, setup:python]
+
+  setup:zig:
+    desc: Download Zig {{.ZIG_VERSION}} into .tools/zig (no root needed)
+    status: ['test -x {{.ZIG}}']
+    cmds:
+      - mkdir -p .tools
+      - curl -sfL https://ziglang.org/download/{{.ZIG_VERSION}}/zig-x86_64-linux-{{.ZIG_VERSION}}.tar.xz | tar -xJ -C .tools
+      - mv .tools/zig-x86_64-linux-{{.ZIG_VERSION}} .tools/zig
+      - '{{.ZIG}} version'
+
+  setup:python:
+    desc: Create python/.venv with paho-mqtt
+    sources: [python/requirements.txt]
+    generates: [python/.venv/bin/python]
+    cmds:
+      - uv venv -q --python /usr/bin/python3 python/.venv
+      - uv pip install -q --python {{.PY}} -r python/requirements.txt
+
+  # ---------------------------------------------------------------- build
+  build:
+    desc: Build all compiled implementations
+    deps: [build:c, build:cpp, build:zig, build:rust]
+
+  build:c:
+    desc: Build C (gcc -Os, libmosquitto + vendored cJSON)
+    sources: [c/main.c, c/vendor/*, c/Makefile]
+    generates: ['{{.C_BIN}}']
+    cmds: [make -s -C c]
+
+  build:cpp:
+    desc: Build C++ (g++ -Os, libmosquitto + RapidJSON)
+    sources: [cpp/main.cpp, cpp/Makefile]
+    generates: ['{{.CPP_BIN}}']
+    cmds: [make -s -C cpp]
+
+  build:zig:
+    desc: Build Zig (-Doptimize=small, libmosquitto via C interop + std.json)
+    deps: [setup:zig]
+    dir: zig
+    sources: [src/*.zig, build.zig]
+    generates: [zig-out/bin/mqtt_bench]
+    cmds: ['../{{.ZIG}} build -Doptimize=small']
+
+  build:rust:
+    desc: Build Rust (release, opt-level=s, LTO; rumqttc + serde_json)
+    dir: rust
+    sources: [src/*.rs, Cargo.toml, Cargo.lock]
+    generates: [target/release/mqtt_bench]
+    cmds: [cargo build --release --quiet]
+
+  # ---------------------------------------------------------------- run (no measurement)
+  run:c:
+    deps: [build:c]
+    cmds: ['./{{.C_BIN}} {{.DURATION}}']
+  run:cpp:
+    deps: [build:cpp]
+    cmds: ['./{{.CPP_BIN}} {{.DURATION}}']
+  run:zig:
+    deps: [build:zig]
+    cmds: ['./{{.ZIG_BIN}} {{.DURATION}}']
+  run:rust:
+    deps: [build:rust]
+    cmds: ['./{{.RUST_BIN}} {{.DURATION}}']
+  run:python:
+    deps: [setup:python]
+    cmds: ['{{.PY}} python/main.py {{.DURATION}}']
+
+  # ---------------------------------------------------------------- benchmark
+  bench:
+    desc: Run every implementation for DURATION seconds (default 120) under measurement, sequentially
+    deps: [build, setup:python]
+    cmds:
+      - task: bench:c
+      - task: bench:cpp
+      - task: bench:zig
+      - task: bench:rust
+      - task: bench:python
+      - task: report
+
+  bench:c:
+    desc: Measure the C implementation
+    deps: [build:c]
+    cmds: ['scripts/measure.sh c {{.C_BIN}} {{.DURATION}} -- ./{{.C_BIN}} {{.DURATION}}']
+
+  bench:cpp:
+    desc: Measure the C++ implementation
+    deps: [build:cpp]
+    cmds: ['scripts/measure.sh cpp {{.CPP_BIN}} {{.DURATION}} -- ./{{.CPP_BIN}} {{.DURATION}}']
+
+  bench:zig:
+    desc: Measure the Zig implementation
+    deps: [build:zig]
+    cmds: ['scripts/measure.sh zig {{.ZIG_BIN}} {{.DURATION}} -- ./{{.ZIG_BIN}} {{.DURATION}}']
+
+  bench:rust:
+    desc: Measure the Rust implementation
+    deps: [build:rust]
+    cmds: ['scripts/measure.sh rust {{.RUST_BIN}} {{.DURATION}} -- ./{{.RUST_BIN}} {{.DURATION}}']
+
+  bench:python:
+    desc: Measure the Python implementation
+    deps: [setup:python]
+    cmds: ['scripts/measure.sh python python/main.py {{.DURATION}} -- {{.PY}} python/main.py {{.DURATION}}']
+
+  report:
+    desc: Print the comparison table from results/ (also written to results/summary.md)
+    silent: true
+    cmds: [scripts/report.sh]
+
+  sizes:
+    desc: Show on-disk sizes of the binaries, their shared libraries and the Python runtime
+    silent: true
+    cmds:
+      - |
+        for b in {{.C_BIN}} {{.CPP_BIN}} {{.ZIG_BIN}} {{.RUST_BIN}}; do
+          [ -f "$b" ] || continue
+          printf '%-32s %8d bytes   libs: %s\n' "$b" "$(stat -c %s "$b")" \
+            "$(ldd "$b" | awk '/=>/ {print $3}' | grep -vE 'libc\.so|libm\.so|libgcc_s|libpthread|libdl|librt' | xargs -r -n1 basename | tr '\n' ' ')"
+        done
+        py=$(readlink -f /usr/bin/python3)
+        printf '%-32s %8d bytes (interpreter %s)\n' python/main.py "$(stat -c %s python/main.py)" "$py"
+        printf '  python interpreter + libpython: %s\n' "$(du -ch "$py" $(ldd "$py" | awk '/libpython/ {print $3}') 2>/dev/null | tail -1 | cut -f1)"
+        printf '  python stdlib (%s): %s\n' "$(/usr/bin/python3 -c 'import os,sysconfig;print(sysconfig.get_paths()["stdlib"])')" "$(du -sh "$(/usr/bin/python3 -c 'import sysconfig;print(sysconfig.get_paths()["stdlib"])')" | cut -f1)"
+        printf '  venv site-packages (paho-mqtt): %s\n' "$(du -sh python/.venv/lib/python*/site-packages | cut -f1)"
+
+  # ---------------------------------------------------------------- helpers
+  send:
+    desc: 'Publish {"message": MESSAGE} to test/receive with content-type application/json'
+    vars:
+      MESSAGE: '{{.MESSAGE | default "hello from task"}}'
+    cmds:
+      - mosquitto_pub -V 5 -h localhost -t test/receive -D publish content-type application/json -m '{"message":"{{.MESSAGE}}"}'
+
+  listen:
+    desc: Print everything published on test/send (Ctrl-C to stop)
+    cmds:
+      - mosquitto_sub -V 5 -h localhost -t test/send -v -F '%U %t %p'
+
+  messages:
+    desc: Show /tmp/messages.txt
+    silent: true
+    cmds: [cat /tmp/messages.txt]
+
+  clean:
+    desc: Remove build outputs and results
+    cmds:
+      - rm -rf c/build cpp/build zig/zig-out zig/.zig-cache rust/target results python/__pycache__
